@@ -1,3 +1,11 @@
-pandas 
-matplotlib 
+pandas
+numpy
+scikit-learn
+matplotlib
 seaborn
+streamlit
+langchain
+openai
+llama-index
+groq
+dotenv
