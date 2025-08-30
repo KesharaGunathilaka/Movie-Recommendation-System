@@ -52,6 +52,7 @@ class SemanticMovieRecommender:
         keywords = _nz(row.get("Keywords", ""))
         plot = _nz(row.get("Plot", ""))
         year = _nz(row.get("Year", row.get("Year Binned", "")))
+        ryear = _nz(row.get("Year", row.get("Release Year", "")))
 
         # emphasize title & plot/keywords
         text = (
@@ -194,7 +195,7 @@ class SemanticMovieRecommender:
                 "Director": r.get("Director"),
                 "Cast": r.get("Cast"),
                 "Genre": r.get("Genre"),
-                "Year": r.get("Year", r.get("Year Binned")),
+                "Year": r.get("Year", r.get("Release Year")),
                 "Poster": r.get("Poster", None),
                 "Plot": r.get("Plot", None),
                 "Score": r.get("_score")
