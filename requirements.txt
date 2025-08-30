@@ -9,3 +9,7 @@ openai
 llama-index
 groq
 dotenv
+sentence-transformers
+rapidfuzz
+faiss-gpu
+faiss-cpu
