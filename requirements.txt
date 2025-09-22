@@ -12,4 +12,5 @@ dotenv
 sentence-transformers
 rapidfuzz
 faiss-gpu
-faiss-cpu
+#torch
+#torchvision
