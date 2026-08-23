@@ -1,4 +1,7 @@
+import hashlib
+import os
 import re
+
 import numpy as np
 import pandas as pd
 import torch
@@ -11,7 +14,8 @@ def _nz(x):
 
 
 class SemanticMovieRecommender:
-    def __init__(self, df: pd.DataFrame, model_name="all-mpnet-base-v2", device=None, batch_size=64):
+    def __init__(self, df: pd.DataFrame, model_name="all-mpnet-base-v2", device=None, batch_size=64,
+                 cache_dir=None):
 
         self.df = df.reset_index(drop=True).copy()
         if "Title" not in self.df.columns:
@@ -25,23 +29,66 @@ class SemanticMovieRecommender:
         # Build rich search text (emphasize plot & keywords)
         self.df["_search_text"] = self.df.apply(
             self._row_to_search_text, axis=1)
+        texts = self.df["_search_text"].tolist()
 
         # load the model on device
         self.model = SentenceTransformer(model_name, device=self.device)
 
-        # encode corpus (batched)
-        # convert_to_tensor True uses PyTorch tensors on device
-        self.embeddings = self.model.encode(
-            self.df["_search_text"].tolist(),
-            convert_to_tensor=True,
-            show_progress_bar=True,
-            batch_size=batch_size,
-            normalize_embeddings=True
-        )
+        # Encoding the whole corpus costs minutes, so keep the result on disk and
+        # reuse it whenever the same texts are encoded with the same model.
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), ".embeddings_cache")
+        cache_path = self._cache_path(cache_dir, model_name, texts)
+        cached = self._load_cached_embeddings(cache_path)
+
+        if cached is not None:
+            print(f"[Recommender] Loaded cached embeddings for {len(texts)} movies")
+            self.embeddings = cached.to(self.device)
+        else:
+            print(f"[Recommender] Encoding {len(texts)} movies "
+                  f"(one-off, the result is cached for later runs)")
+            # encode corpus (batched)
+            # convert_to_tensor True uses PyTorch tensors on device
+            self.embeddings = self.model.encode(
+                texts,
+                convert_to_tensor=True,
+                show_progress_bar=True,
+                batch_size=batch_size,
+                normalize_embeddings=True
+            )
+            self._save_embeddings(cache_path, self.embeddings)
+            print(f"[Recommender] Cached embeddings to {cache_path}")
 
         # lower titles for lookup
         self.titles = self.df["Title"].astype(str)
         self.titles_lower = self.titles.str.lower().str.strip().tolist()
+
+    # ---- embedding cache ----
+    @staticmethod
+    def _cache_path(cache_dir, model_name, texts):
+        """Cache file name derived from the model and the exact corpus text."""
+        digest = hashlib.sha256()
+        digest.update(model_name.encode("utf-8"))
+        digest.update(str(len(texts)).encode("utf-8"))
+        for text in texts:
+            digest.update(text.encode("utf-8", "ignore"))
+        return os.path.join(cache_dir, f"{digest.hexdigest()[:16]}.npy")
+
+    @staticmethod
+    def _load_cached_embeddings(path):
+        if not os.path.exists(path):
+            return None
+        try:
+            return torch.from_numpy(np.load(path))
+        except Exception as e:
+            print(f"[Recommender] Ignoring unreadable cache {path}: {e}")
+            return None
+
+    @staticmethod
+    def _save_embeddings(path, embeddings):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.save(path, embeddings.cpu().numpy())
 
     # ---- text building ----
     def _row_to_search_text(self, row):
@@ -68,21 +115,35 @@ class SemanticMovieRecommender:
         return text.strip()
 
     # ---- fuzzy title find ----
-    def fuzzy_title_index(self, query, cutoff=80):
-        res = process.extractOne(query.lower().strip(
-        ), self.titles_lower, scorer=fuzz.WRatio, score_cutoff=cutoff)
-        if res:
-            title_matched, score, idx = res
-            return idx, title_matched, score
-        return None, None, None
+    def fuzzy_title_index(self, query, cutoff=80, min_length_ratio=0.6):
+        """Find the title a query is referring to, if it is referring to one.
+
+        WRatio scores a short title highly whenever it appears anywhere inside a
+        longer string, so "christopher nolan movies" matches the film "Her" and
+        "space survival thriller" matches "Urvi". Requiring the matched title to
+        be a comparable length keeps real (and misspelled) title lookups working
+        while letting descriptive queries fall through to semantic search.
+        """
+        q = query.lower().strip()
+        res = process.extractOne(
+            q, self.titles_lower, scorer=fuzz.WRatio, score_cutoff=cutoff)
+        if not res:
+            return None, None, None
+
+        title_matched, score, idx = res
+        if len(title_matched) < min_length_ratio * len(q):
+            return None, None, None
+        return idx, title_matched, score
 
     # ---- role masks ----
     def role_masks(self, person):
         p = person.lower().strip()
+        # regex=False: names contain "." and "-" which would otherwise be
+        # interpreted as pattern syntax (e.g. "m. night shyamalan")
         dir_mask = self.df.get("Director", pd.Series(
-            [""]*len(self.df))).astype(str).str.lower().str.contains(p, na=False)
+            [""]*len(self.df))).astype(str).str.lower().str.contains(p, na=False, regex=False)
         cast_mask = self.df.get("Cast", pd.Series(
-            [""]*len(self.df))).astype(str).str.lower().str.contains(p, na=False)
+            [""]*len(self.df))).astype(str).str.lower().str.contains(p, na=False, regex=False)
         return dir_mask, cast_mask
 
     # ---- semantic search helpers ----
@@ -92,10 +153,18 @@ class SemanticMovieRecommender:
         sims = util.cos_sim(q_emb, self.embeddings)[0]  # tensor
         return sims.cpu().numpy()  # 1D array
 
+    def _neighbors(self, idx, top_n):
+        """Films whose embeddings sit closest to the film at `idx`."""
+        sims = util.cos_sim(self.embeddings[idx], self.embeddings)[
+            0].cpu().numpy()
+        sims[idx] = -1.0  # exclude the film itself
+        top_idxs = np.argsort(-sims)[: top_n]
+        return self._rows_from_idxs(top_idxs, sims[top_idxs])
+
     # ---- public recommend ----
     def recommend(self, query, top_n=10, fuzzy_title_cutoff=85):
         """
-        Returns list of dicts: {Title, Director, Cast, Genre, Score, Poster?, Year?, Plot?}
+        Returns list of dicts: {Title, Director, Cast, Genre, Year, Plot, Score}
         """
         text = str(query).strip()
         low = text.lower()
@@ -109,29 +178,37 @@ class SemanticMovieRecommender:
             mask = self.df["Title"].str.lower().str.contains(re.escape(phrase))
             if mask.sum() > 0:
                 subset = self.df[mask].copy()
-                # try sort by Year if present
-                if "Year" in subset.columns:
-                    try:
-                        subset["__yr"] = pd.to_numeric(
-                            subset["Year"], errors="coerce")
-                        subset = subset.sort_values(
-                            "__yr").drop(columns="__yr")
-                    except:
-                        subset = subset.sort_values("Title")
-                return subset.head(top_n).to_dict(orient="records")
+                # try sort by release year if present, so a franchise reads in order
+                year_col = next(
+                    (c for c in ("Year", "Release Year") if c in subset.columns), None)
+                if year_col:
+                    subset["__yr"] = pd.to_numeric(
+                        subset[year_col], errors="coerce")
+                    subset = subset.sort_values("__yr").drop(columns="__yr")
+                else:
+                    subset = subset.sort_values("Title")
+                # go through _rows_from_idxs so this branch returns the same
+                # shape (and a score) as every other branch
+                idxs = subset.head(top_n).index.tolist()
+                sims = self._semantic_query_scores(text)
+                return self._rows_from_idxs(idxs, sims[idxs])
 
-        # 1) Exact / fuzzy title: "movies like <title>" or user inputs title
-        # check if query matches a title strongly
+        # 1) Explicit similarity request: "movies like <title>", "similar to <title>".
+        # Handled before the whole-query title check, because the surrounding
+        # words make the query too long to match the title on its own.
+        like_m = re.search(r"(?:like|similar to)\s+(.+)$", low)
+        if like_m:
+            idx, _, _ = self.fuzzy_title_index(
+                like_m.group(1).strip(), cutoff=75)
+            if idx is not None:
+                return self._neighbors(idx, top_n)
+
+        # 2) The query is itself a title: return that film's nearest neighbours
         idx, _, score = self.fuzzy_title_index(text, cutoff=fuzzy_title_cutoff)
         if idx is not None:
-            # neighbor search: find top similar embeddings to movie idx
-            target_emb = self.embeddings[idx]
-            sims = util.cos_sim(target_emb, self.embeddings)[0].cpu().numpy()
-            sims[idx] = -1.0  # exclude itself
-            top_idxs = np.argsort(-sims)[: top_n]
-            return self._rows_from_idxs(top_idxs, sims[top_idxs])
+            return self._neighbors(idx, top_n)
 
-        # 2) Person-based queries: "Christopher Nolan movies", "Tom Holland action movie"
+        # 3) Person-based queries: "Christopher Nolan movies", "Tom Holland action movie"
         # Basic pattern detection: "<person> movies|films", "movies with <person>", "directed by <person>"
         person_m = re.search(
             r"(?:movies|films|films?)\s+(?:with|featuring)\s+([a-z .'-]+)", low)
@@ -142,20 +219,20 @@ class SemanticMovieRecommender:
                 r"(?:directed by|by)\s+([a-z .'-]+)(.*)$", low)
         if person_m:
             person = person_m.group(1).strip()
-            rest = (person_m.group(2).strip() if len(
-                person_m.groups()) > 1 and person_m.group(2) else "")
-            # semantic search on full query
-            sims = self._semantic_query_scores(text)
-            top_idxs = np.argsort(-sims)[: top_n*3]
             dir_mask, cast_mask = self.role_masks(person)
-            boost = (dir_mask | cast_mask).astype(float).values * 0.25
-            reranked = sorted([(i, float(sims[i] + boost[i]))
-                              for i in top_idxs], key=lambda x: x[1], reverse=True)[:top_n]
-            idxs = [i for i, _ in reranked]
-            scores = np.array([s for _, s in reranked])
-            return self._rows_from_idxs(idxs, scores)
+            role_mask = (dir_mask | cast_mask).values
+            # Restrict to that person's filmography first, then rank it
+            # semantically. Boosting inside an already-chosen candidate list
+            # cannot surface their films if none made the shortlist to start
+            # with, which is why "Christopher Nolan movies" used to return none.
+            if role_mask.sum() > 0:
+                sims = self._semantic_query_scores(text)
+                candidates = np.where(role_mask)[0]
+                order = candidates[np.argsort(-sims[candidates])][:top_n]
+                return self._rows_from_idxs(order, sims[order])
+            # unknown person - fall through to plain semantic search below
 
-        # 3) General natural language semantic search
+        # 4) General natural language semantic search
         sims = self._semantic_query_scores(text)
         top_idxs = np.argsort(-sims)[: top_n * 3]
 
@@ -168,21 +245,15 @@ class SemanticMovieRecommender:
                     [""]*len(self.df))).astype(str).str.lower().str.contains(g)
                 boosts += mask.astype(float).values * 0.07
 
-        # title-like inside query e.g. "like iron man"
-        m = re.search(r"(?:like|similar to)\s+(.+)$", low)
-        if m:
-            maybe_title = m.group(1).strip()
-            idx2, _, _ = self.fuzzy_title_index(maybe_title, cutoff=75)
-            if idx2 is not None:
-                n_sims = util.cos_sim(self.embeddings[idx2], self.embeddings)[
-                    0].cpu().numpy()
-                boosts += n_sims * 0.1
-
         reranked = sorted([(i, float(sims[i] + boosts[i]))
                           for i in top_idxs], key=lambda x: x[1], reverse=True)[:top_n]
         idxs = [i for i, _ in reranked]
         scores = np.array([s for _, s in reranked])
         return self._rows_from_idxs(idxs, scores)
+
+    # Plots run to several thousand characters, but the UI only shows a snippet,
+    # so trim them rather than shipping ~4 KB per result.
+    PLOT_CHARS = 1200
 
     def _rows_from_idxs(self, idxs, scores):
         rows = []
@@ -196,8 +267,16 @@ class SemanticMovieRecommender:
                 "Cast": r.get("Cast"),
                 "Genre": r.get("Genre"),
                 "Year": r.get("Year", r.get("Release Year")),
-                "Poster": r.get("Poster", None),
-                "Plot": r.get("Plot", None),
+                "Plot": self._trim_plot(r.get("Plot")),
                 "Score": r.get("_score")
             })
         return rows
+
+    @classmethod
+    def _trim_plot(cls, plot):
+        if not isinstance(plot, str):
+            return None
+        plot = plot.strip()
+        if len(plot) <= cls.PLOT_CHARS:
+            return plot
+        return plot[:cls.PLOT_CHARS].rsplit(" ", 1)[0] + "..."

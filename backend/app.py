@@ -14,15 +14,49 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "all-mpnet-base-v2")
 DEVICE = os.environ.get("DEVICE", None)
 TOP_N_DEFAULT = int(os.environ.get("TOP_N", "10"))
 
+def _strip_labels(series, pattern):
+    """Drop a leading "Label:" block from a column and flatten its newlines."""
+    return (series.fillna("").astype(str)
+            .str.replace(pattern, "", regex=True)
+            .str.replace(r"\s*\r?\n\s*", " ", regex=True)
+            .str.strip())
+
+
+def prepare(df):
+    """Clean up known quirks of the source dataset before anything is embedded."""
+    df = df.copy()
+    df["Title"] = df["Title"].fillna("").astype(str).str.strip()
+    # ~100 titles arrive doubled, as "Avengers, TheThe Avengers"
+    df["Title"] = df["Title"].str.replace(
+        r"^(?P<base>.+), (?P<art>The|A|An)(?P=art) (?P=base)$",
+        lambda m: f"{m.group('art')} {m.group('base')}", regex=True)
+    # ~580 rows carry a leftover "Director:" label from the source wiki tables
+    df["Director"] = _strip_labels(df["Director"], r"^\s*Directors?:\s*")
+    # ~620 cast fields hold an entire labelled block instead of a cast list:
+    # "Director: Roger Christian<newline>Cast: Christian Slater, ..."
+    df["Cast"] = _strip_labels(df["Cast"], r"(?s)^.*?\bCast:\s*")
+    # the same film is listed once per origin/ethnicity, so titles repeat
+    before = len(df)
+    df = df.drop_duplicates(
+        subset=["Title", "Release Year"], keep="first").reset_index(drop=True)
+    print(f"[API] {before} rows loaded, {len(df)} after removing duplicates")
+    return df
+
+
 print(f"[API] Loading movies from {DATA_PATH}")
-df = pd.read_csv(DATA_PATH)  # ensure your CSV exists
+df = prepare(pd.read_csv(DATA_PATH))  # ensure your CSV exists
 recommender = SemanticMovieRecommender(
     df, model_name=MODEL_NAME, device=DEVICE)
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "device": recommender.device})
+    return jsonify({
+        "status": "ok",
+        "device": recommender.device,
+        "model": MODEL_NAME,
+        "movies": len(df),
+    })
 
 
 @app.route("/recommend", methods=["POST"])

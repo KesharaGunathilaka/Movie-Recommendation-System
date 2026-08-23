@@ -1,16 +1,17 @@
+# Dependencies for the exploration notebook (Movie_Recommendation.ipynb),
+# which covers preprocessing, the TF-IDF baseline and the FAISS experiments.
+#
+# To run the web app instead, see backend/requirements.txt (API) and
+# frontend/package.json (UI).
+
 pandas
 numpy
 scikit-learn
 matplotlib
 seaborn
-streamlit
-langchain
-openai
-llama-index
-groq
-dotenv
+torch
 sentence-transformers
 rapidfuzz
-faiss-gpu
-#torch
-#torchvision
+faiss-cpu
+python-dotenv
+nest-asyncio
