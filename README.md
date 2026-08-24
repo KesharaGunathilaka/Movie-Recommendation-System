@@ -31,10 +31,10 @@ kinds of request:
 
 | Example query | What happens | Actual top results |
 |---|---|---|
-| `space survival thriller` | Semantic search, with a boost for the detected genre | Attraction, Gravity, Salyut-7 |
-| `movies like Interstellar` | Resolves the title, then finds its nearest neighbours in embedding space | Gravity, Mission to Mars, Red Planet |
-| `Christopher Nolan movies` | Narrows to that person's filmography, then ranks it semantically | The Dark Knight Rises, The Dark Knight, Batman Begins |
-| `billionaire superhero` | Pure semantic search over plot and keyword embeddings | Daredevil, Watchmen, Super |
+| `space survival thriller` | Semantic search, with a boost for the detected genre | Gravity, Salyut-7, Attraction |
+| `movies like Interstellar` | Resolves the title, then finds its nearest neighbours chunk-to-chunk | Gravity, Solaris, Prometheus |
+| `Christopher Nolan movies` | Narrows to that person's filmography, then ranks it semantically | The Dark Knight Rises, The Dark Knight, Inception |
+| `heist gone wrong` | Pure semantic search over the plot chunks | Heist, Tower Heist, Stolen |
 | `star wars collection` | Franchise detection — returns matching titles in release order | Attack of the Clones, Revenge of the Sith |
 
 Titles are matched with RapidFuzz, so `intersteller` and `Interstellar` land on the
@@ -67,15 +67,33 @@ matches *Urvi*.
                               │
                               v
                  ┌──────────────────────────┐
-                 │ Cached corpus embeddings │
-                 │ 12,327 x 768 float32     │
+                 │ Cached chunk embeddings  │
+                 │ 48,405 chunks           │
                  └──────────────────────────┘
 ```
 
-Encoding the whole corpus takes minutes, so the embedding matrix is written to disk on
-first run and keyed by a hash of the model name and the corpus text. Later starts load
-it in about a second, and the cache invalidates itself automatically if the dataset or
-model changes.
+Encoding the corpus takes minutes, so the embedding matrix is written to disk on first
+run and keyed by a hash of the model name and the corpus text. Later starts load it in
+about a second, and the cache invalidates itself automatically if the dataset or model
+changes.
+
+### Why chunks, not one vector per film
+
+The encoder reads at most **384 tokens**, but these documents run to around 2,000. A
+single vector per film therefore threw away most of the plot *and* diluted whatever
+survived — a specific detail buried in a long document barely moves a whole-film vector.
+
+The symptom: searching `billionaire superhero` did not return Iron Man, even though its
+plot opens with "Genius, billionaire, and playboy Tony Stark". That phrase was averaged
+into oblivion.
+
+So each film is split into a short profile (title, genres, keywords, director, cast) plus
+several plot windows, each embedded separately. A film scores as its **single
+best-matching chunk**, which keeps a sharp local match from being averaged away.
+
+A TF-IDF index over the full text runs alongside the dense one and contributes a smaller
+weighted term. The dense model only ever reads the first 384 tokens of a document, so the
+sparse index is what catches a rare word appearing late in a plot.
 
 ## Tech stack
 
@@ -199,6 +217,23 @@ Returns API status, the active device, the model in use and the number of movies
 │   └── processed/          Cleaned dataset used by the API
 └── Movie_Recommendation.ipynb   Preprocessing, TF-IDF baseline, experiments
 ```
+
+## Known limitations
+
+**Ranking can only use what the plots actually say.** Searching `billionaire superhero`
+returns Iron Man, because its plot opens "Genius, billionaire, and playboy Tony Stark".
+It does *not* return the Batman films, even though Bruce Wayne is the other obvious
+answer — their plots never describe him as wealthy, mentioning only "heir" and "Wayne
+Enterprises". No amount of retrieval tuning fixes that; it needs character or metadata
+enrichment from a source such as TMDB.
+
+**Retrieval quality was tuned, not proven.** The dense/sparse weighting was chosen by
+comparing candidate configurations on a handful of queries, not against a labelled
+relevance set. Reciprocal rank fusion and pure-dense retrieval were both tried and both
+scored worse on those queries, but that is a small sample, not a benchmark.
+
+**Some source rows are still messy.** A number of films list cast names in the `Genre`
+column, which the load-time clean-up does not attempt to repair.
 
 ## Future work
 

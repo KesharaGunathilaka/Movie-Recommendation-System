@@ -28,7 +28,7 @@ def prepare(df):
     df["Title"] = df["Title"].fillna("").astype(str).str.strip()
     # ~100 titles arrive doubled, as "Avengers, TheThe Avengers"
     df["Title"] = df["Title"].str.replace(
-        r"^(?P<base>.+), (?P<art>The|A|An)(?P=art) (?P=base)$",
+        r"^(?P<base>.+), (?P<art>The|A|An)\W*(?P=art) (?P=base)$",
         lambda m: f"{m.group('art')} {m.group('base')}", regex=True)
     # ~580 rows carry a leftover "Director:" label from the source wiki tables
     df["Director"] = _strip_labels(df["Director"], r"^\s*Directors?:\s*")

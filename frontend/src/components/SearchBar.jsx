@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef } from "react";
 
 // Each example deliberately exercises a different branch of the recommender:
 // plain semantic search, title neighbours, person lookup, genre boosting and
@@ -11,49 +11,78 @@ const SUGGESTIONS = [
     "star wars collection",
 ];
 
-export default function SearchBar({ onSearch, loading = false, initQuery = "" }) {
-    const [q, setQ] = useState(initQuery);
+export default function SearchBar({ value, onChange, onSearch, loading = false }) {
+    const inputRef = useRef(null);
+
+    // "/" focuses the search box from anywhere, the way most search UIs behave.
+    useEffect(() => {
+        function onKey(e) {
+            if (e.key === "/" && document.activeElement !== inputRef.current) {
+                e.preventDefault();
+                inputRef.current?.focus();
+            }
+        }
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, []);
 
     function submit(e) {
         e && e.preventDefault();
-        if (!q.trim() || loading) return;
-        onSearch(q.trim());
+        if (!value.trim() || loading) return;
+        onSearch(value.trim());
     }
 
-    function runSuggestion(s) {
-        if (loading) return;
-        setQ(s);
-        onSearch(s);
+    function chipClass(active) {
+        const base = "rounded-full border px-3 py-1 text-sm transition disabled:opacity-50 ";
+        return base + (active
+            ? "border-accent-dim bg-ink-800 text-accent-soft"
+            : "border-ink-700 text-ink-400 hover:border-ink-500 hover:text-ink-100");
     }
 
     return (
-        <div className="rounded-xl border border-slate-700/60 bg-gradient-to-r from-slate-800/70 to-slate-700/50 p-5 shadow-lg sm:p-6">
+        <div className="rounded-xl border border-ink-700 bg-ink-900 p-5">
             <form onSubmit={submit} className="flex flex-col gap-3 sm:flex-row">
-                <input
-                    value={q}
-                    onChange={e => setQ(e.target.value)}
-                    placeholder="Describe a movie, or name a title, actor or director..."
-                    aria-label="Search movies"
-                    className="flex-1 rounded-lg border border-slate-600 bg-slate-900/50 px-4 py-3 text-white placeholder:text-slate-500 focus:border-sky-400 focus:outline-none"
-                />
+                <div className="relative flex-1">
+                    <input
+                        ref={inputRef}
+                        value={value}
+                        onChange={e => onChange(e.target.value)}
+                        onKeyDown={e => { if (e.key === "Escape") onChange(""); }}
+                        placeholder="Describe a film, or name a title, actor or director..."
+                        aria-label="Search films"
+                        className="w-full rounded-lg border border-ink-700 bg-ink-950 px-4 py-3 pr-16 text-ink-100 placeholder:text-ink-500 focus:border-accent-dim focus:outline-none"
+                    />
+                    {value ? (
+                        <button
+                            type="button"
+                            onClick={() => { onChange(""); inputRef.current?.focus(); }}
+                            aria-label="Clear search"
+                            className="absolute top-1/2 right-3 -translate-y-1/2 rounded px-2 text-ink-500 transition hover:text-ink-100"
+                        >
+                            ✕
+                        </button>
+                    ) : (
+                        <span className="kbd absolute top-1/2 right-3 hidden -translate-y-1/2 sm:block">/</span>
+                    )}
+                </div>
                 <button
                     type="submit"
-                    disabled={loading || !q.trim()}
-                    className="rounded-lg bg-sky-500 px-6 py-3 font-semibold text-slate-950 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-400"
+                    disabled={loading || !value.trim()}
+                    className="rounded-lg bg-accent px-6 py-3 font-semibold text-ink-950 transition hover:bg-accent-soft disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
                 >
                     {loading ? "Searching..." : "Search"}
                 </button>
             </form>
 
             <div className="mt-4 flex flex-wrap items-center gap-2">
-                <span className="text-xs tracking-wide text-slate-500 uppercase">Try</span>
+                <span className="text-xs tracking-wide text-ink-500 uppercase">Try</span>
                 {SUGGESTIONS.map(s => (
                     <button
                         key={s}
                         type="button"
-                        onClick={() => runSuggestion(s)}
+                        onClick={() => !loading && onSearch(s)}
                         disabled={loading}
-                        className="rounded-full border border-slate-600/70 px-3 py-1 text-sm text-slate-300 transition hover:border-sky-400/60 hover:text-sky-300 disabled:opacity-50"
+                        className={chipClass(value === s)}
                     >
                         {s}
                     </button>

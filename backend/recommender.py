@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer, util
+from sklearn.feature_extraction.text import TfidfVectorizer
 from rapidfuzz import process, fuzz
 
 
@@ -39,30 +40,85 @@ class SemanticMovieRecommender:
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(
                 os.path.abspath(__file__)), ".embeddings_cache")
-        cache_path = self._cache_path(cache_dir, model_name, texts)
+        chunk_texts, owners = [], []
+        for pos, (_, row) in enumerate(self.df.iterrows()):
+            for chunk in self._row_to_chunks(row):
+                chunk_texts.append(chunk)
+                owners.append(pos)
+        self.chunk_owner = np.asarray(owners, dtype=np.int64)
+
+        cache_path = self._cache_path(cache_dir, model_name, chunk_texts)
         cached = self._load_cached_embeddings(cache_path)
 
         if cached is not None:
-            print(f"[Recommender] Loaded cached embeddings for {len(texts)} movies")
-            self.embeddings = cached.to(self.device)
+            print(f"[Recommender] Loaded cached embeddings: "
+                  f"{len(chunk_texts)} chunks over {len(texts)} movies")
+            self.chunk_embeddings = cached.to(self.device)
         else:
-            print(f"[Recommender] Encoding {len(texts)} movies "
-                  f"(one-off, the result is cached for later runs)")
-            # encode corpus (batched)
-            # convert_to_tensor True uses PyTorch tensors on device
-            self.embeddings = self.model.encode(
-                texts,
+            print(f"[Recommender] Encoding {len(chunk_texts)} chunks over "
+                  f"{len(texts)} movies (one-off, cached for later runs)")
+            self.chunk_embeddings = self.model.encode(
+                chunk_texts,
                 convert_to_tensor=True,
                 show_progress_bar=True,
                 batch_size=batch_size,
                 normalize_embeddings=True
             )
-            self._save_embeddings(cache_path, self.embeddings)
+            self._save_embeddings(cache_path, self.chunk_embeddings)
             print(f"[Recommender] Cached embeddings to {cache_path}")
+
+        # A film-level vector (mean of its chunks) is still needed for
+        # film-to-film neighbour search.
+        self.embeddings = self._film_embeddings(len(texts))
+
+        # Sparse lexical index over the *full* text. The dense encoder only ever
+        # sees the first 384 tokens, so a rare word buried deep in a plot
+        # ("billionaire" in Iron Man) is invisible to it. TF-IDF catches those,
+        # and the two signals are combined at query time.
+        self.vectorizer = TfidfVectorizer(
+            stop_words="english", sublinear_tf=True, min_df=2)
+        self.lexical_matrix = self.vectorizer.fit_transform(texts)
 
         # lower titles for lookup
         self.titles = self.df["Title"].astype(str)
         self.titles_lower = self.titles.str.lower().str.strip().tolist()
+
+    # ---- chunking ----
+    # A whole film compressed into one vector loses specifics: Iron Man's plot
+    # opens "Genius, billionaire, and playboy Tony Stark", but that phrase is
+    # diluted across ~2000 tokens, of which the encoder only reads 384. So each
+    # film is split into a short profile plus a few plot windows, and a film
+    # scores as its single best-matching piece.
+    PLOT_WORDS_PER_CHUNK = 120
+    MAX_PLOT_CHUNKS = 4
+
+    def _row_to_chunks(self, row):
+        title = _nz(row.get("Title", ""))
+        year = _nz(row.get("Year", row.get("Release Year", "")))
+        genre = _nz(row.get("Genre", ""))
+        keywords = re.sub(r"[\[\]'\"]", "", _nz(row.get("Keywords", "")))
+        director = _nz(row.get("Director", ""))
+        cast = _nz(row.get("Cast", ""))
+        plot = _nz(row.get("Plot", ""))
+
+        head = f"{title} ({year})" if year else title
+        profile = ". ".join(p for p in [
+            head,
+            f"Genres: {genre}" if genre.strip() else "",
+            f"Keywords: {keywords}" if keywords.strip() else "",
+            f"Directed by {director}" if director.strip() else "",
+            f"Starring {cast}" if cast.strip() else "",
+        ] if p)
+        chunks = [profile]
+
+        words = plot.split()
+        step = self.PLOT_WORDS_PER_CHUNK
+        for i in range(0, min(len(words), step * self.MAX_PLOT_CHUNKS), step):
+            window = " ".join(words[i:i + step])
+            if window.strip():
+                # prefix the title so a bare plot window keeps its subject
+                chunks.append(f"{head}. {window}")
+        return chunks
 
     # ---- embedding cache ----
     @staticmethod
@@ -92,27 +148,31 @@ class SemanticMovieRecommender:
 
     # ---- text building ----
     def _row_to_search_text(self, row):
+        """One searchable document per film.
+
+        The encoder truncates at 384 tokens but these documents run to ~2000, so
+        ordering matters: lead with the fields that identify a film and let the
+        tail of the plot fall off the end. The previous template repeated both
+        keywords and plot, which spent most of that small window on duplicates.
+        """
         title = _nz(row.get("Title", ""))
         director = _nz(row.get("Director", ""))
         cast = _nz(row.get("Cast", ""))
         genre = _nz(row.get("Genre", ""))
-        keywords = _nz(row.get("Keywords", ""))
+        # Keywords are stored as a stringified list: "['magical', 'queen']"
+        keywords = re.sub(r"[\[\]'\"]", "", _nz(row.get("Keywords", "")))
         plot = _nz(row.get("Plot", ""))
-        year = _nz(row.get("Year", row.get("Year Binned", "")))
-        ryear = _nz(row.get("Year", row.get("Release Year", "")))
+        year = _nz(row.get("Year", row.get("Release Year", "")))
 
-        # emphasize title & plot/keywords
-        text = (
-            f"{title}. "
-            f"Director: {director}. "
-            f"Cast: {cast}. "
-            f"Genres: {genre}. "
-            f"Keywords: {keywords}. {keywords}. "
-            f"Plot: {plot}. {plot}. "
-            f"Year: {year}. "
-            f"{title}."
-        )
-        return text.strip()
+        parts = [f"{title} ({year})" if year else title]
+        for label, value in (("Genres", genre), ("Keywords", keywords),
+                             ("Directed by", director), ("Starring", cast),
+                             ("Plot", plot)):
+            value = value.strip()
+            if value:
+                sep = ":" if label in ("Genres", "Keywords", "Plot") else ""
+                parts.append(f"{label}{sep} {value}")
+        return ". ".join(p.strip(" .") for p in parts)
 
     # ---- fuzzy title find ----
     def fuzzy_title_index(self, query, cutoff=80, min_length_ratio=0.6):
@@ -147,16 +207,57 @@ class SemanticMovieRecommender:
         return dir_mask, cast_mask
 
     # ---- semantic search helpers ----
+    # How much the lexical signal counts relative to the dense one. Both are
+    # cosine similarities, but lexical scores are far sparser, so it needs
+    # weighting up to matter.
+    LEXICAL_WEIGHT = 0.5
+
+    def _film_embeddings(self, n_films):
+        """Mean of each film's chunk vectors, renormalised."""
+        owner = torch.as_tensor(self.chunk_owner, device=self.chunk_embeddings.device)
+        dim = self.chunk_embeddings.shape[1]
+        summed = torch.zeros((n_films, dim), device=self.chunk_embeddings.device,
+                             dtype=self.chunk_embeddings.dtype)
+        summed.index_add_(0, owner, self.chunk_embeddings)
+        counts = torch.zeros(n_films, device=summed.device, dtype=summed.dtype)
+        counts.index_add_(0, owner, torch.ones_like(owner, dtype=summed.dtype))
+        return torch.nn.functional.normalize(summed / counts.unsqueeze(1), dim=1)
+
     def _semantic_query_scores(self, query):
+        """Best-matching chunk per film, rather than one diluted whole-film vector."""
         q_emb = self.model.encode(
             [query], convert_to_tensor=True, normalize_embeddings=True)
-        sims = util.cos_sim(q_emb, self.embeddings)[0]  # tensor
-        return sims.cpu().numpy()  # 1D array
+        chunk_sims = util.cos_sim(q_emb, self.chunk_embeddings)[0]
+        owner = torch.as_tensor(self.chunk_owner, device=chunk_sims.device)
+        best = torch.full((len(self.df),), -1.0, device=chunk_sims.device,
+                          dtype=chunk_sims.dtype)
+        best.scatter_reduce_(0, owner, chunk_sims, reduce="amax", include_self=True)
+        return best.cpu().numpy()
+
+    def _lexical_query_scores(self, query):
+        q_vec = self.vectorizer.transform([query])
+        # TfidfVectorizer L2-normalises rows, so this dot product is a cosine
+        return (self.lexical_matrix @ q_vec.T).toarray().ravel()
+
+    def _query_scores(self, query):
+        """Dense meaning + sparse keyword match."""
+        return (self._semantic_query_scores(query)
+                + self.LEXICAL_WEIGHT * self._lexical_query_scores(query))
 
     def _neighbors(self, idx, top_n):
-        """Films whose embeddings sit closest to the film at `idx`."""
-        sims = util.cos_sim(self.embeddings[idx], self.embeddings)[
-            0].cpu().numpy()
+        """Films closest to the film at `idx`.
+
+        Compared chunk-to-chunk rather than through the averaged film vectors:
+        averaging re-introduces exactly the dilution that chunking removes, and
+        made "movies like Interstellar" rank obscure titles above The Martian.
+        """
+        owner = torch.as_tensor(self.chunk_owner, device=self.chunk_embeddings.device)
+        target = self.chunk_embeddings[owner == idx]
+        # best pairing between any chunk of the target and any chunk of a candidate
+        pair = util.cos_sim(target, self.chunk_embeddings).max(dim=0).values
+        best = torch.full((len(self.df),), -1.0, device=pair.device, dtype=pair.dtype)
+        best.scatter_reduce_(0, owner, pair, reduce="amax", include_self=True)
+        sims = best.cpu().numpy()
         sims[idx] = -1.0  # exclude the film itself
         top_idxs = np.argsort(-sims)[: top_n]
         return self._rows_from_idxs(top_idxs, sims[top_idxs])
@@ -190,7 +291,7 @@ class SemanticMovieRecommender:
                 # go through _rows_from_idxs so this branch returns the same
                 # shape (and a score) as every other branch
                 idxs = subset.head(top_n).index.tolist()
-                sims = self._semantic_query_scores(text)
+                sims = self._query_scores(text)
                 return self._rows_from_idxs(idxs, sims[idxs])
 
         # 1) Explicit similarity request: "movies like <title>", "similar to <title>".
@@ -226,14 +327,14 @@ class SemanticMovieRecommender:
             # cannot surface their films if none made the shortlist to start
             # with, which is why "Christopher Nolan movies" used to return none.
             if role_mask.sum() > 0:
-                sims = self._semantic_query_scores(text)
+                sims = self._query_scores(text)
                 candidates = np.where(role_mask)[0]
                 order = candidates[np.argsort(-sims[candidates])][:top_n]
                 return self._rows_from_idxs(order, sims[order])
             # unknown person - fall through to plain semantic search below
 
         # 4) General natural language semantic search
-        sims = self._semantic_query_scores(text)
+        sims = self._query_scores(text)
         top_idxs = np.argsort(-sims)[: top_n * 3]
 
         # genre detection boosts
